@@ -1,5 +1,6 @@
 local AshenFarmer = {}
 AshenFarmer.UIParent = UIParent
+AshenFarmer.DEBUG = false
 
 -- Whether the app is running
 AshenFarmer.running = false
@@ -9,6 +10,9 @@ AshenFarmer.casting = false
 AshenFarmer.targetting = false
 -- Whether we are sending command to drink
 AshenFarmer.drinking = false
+-- We are waiting for a delay-check for drinking buff to appear
+AshenFarmer.drinkCheck = nil
+AshenFarmer.drinkWaitingTime = 30 -- ~0.5-1 seconds
 
 AshenFarmer.signs = {}
 AshenFarmer.signs.target = {1, 0, 0}
@@ -63,43 +67,75 @@ AshenFarmer.f = CreateFrame("Frame");
 function AshenFarmer.f:onUpdate(sinceLastUpdate)
     -- If the app is not running, we should bail out
     if (not AshenFarmer.running) then return; end
+
+    if (AshenFarmer.drinkCheck ~= nil) then
+        -- Drink check is not nil, we have to wait for it
+        if (AshenFarmer.drinkCheck <= 0) then
+            -- Drink check waiting time expired...
+            if (AshenFarmer.isDrinking()) then
+                if (AshenFarmer.DEBUG) then print("We are drinking now. Dismissing drinkCheck...") end
+                AshenFarmer.drinkCheck = nil
+            else
+                print("Somehow first drinking command failed! Trying again...")
+                AshenFarmer.drink()
+            end
+        else
+            AshenFarmer.drinkCheck = AshenFarmer.drinkCheck - 1
+        end
+    end
 end
 
 AshenFarmer.f:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+AshenFarmer.f:RegisterEvent("UNIT_SPELLCAST_FAILED")
 AshenFarmer.f:RegisterEvent("PLAYER_TARGET_CHANGED")
 AshenFarmer.f:RegisterEvent("UNIT_AURA")
 
-function AshenFarmer.f_OnEvent(self, event, ...)
-    if (event == nil or not AshenFarmer.running) then return end
+function AshenFarmer.f_OnEvent(self, event, player, ...)
+    if (event == nil or not AshenFarmer.running) then return; end
     -- print("Received event: ", event, ...)
 
     if (event == "UNIT_AURA") then
         -- if (not AshenFarmer.drinking) then return; end
-        if (not AshenFarmer.drinking) then return end
+        if (not AshenFarmer.drinking) then return; end
 
-        -- Go through the list of buffs and search for a drink buff. If it is there, we are still drinking.
-        -- If it is not, we just finished drinking!
-        local i = 1
-        while (true) do
-            local name, _, _, _, _, _, _, _, _, _, _ = UnitBuff("player", i)
-            if (name == nil) then
-                print("We reached the end of buff list, but did not find any drink!")
-                print("That means, that we finished drinking!")
-                AshenFarmer.drinking = false
-                AshenFarmer.doingNothing()
-                return
-            elseif (name == "Drink") then
-                print("Found a drink at pos: " .. i .. " so we are still drinking...")
+        if (AshenFarmer.isDrinking()) then
+            AshenFarmer.colorIt(AshenFarmer.signs.nop)
+            AshenFarmer.drinkCheck = nil
+        else
+            if (AshenFarmer.drinkCheck ~= nil) then return; end
+            -- Seems like we finished drinking
+            if (AshenFarmer.manaLow()) then
+                -- Our mana is not high though, we might have to wait for the buff to appear on the list... 
+                print("But our mana is not high! Waiting...")
+                AshenFarmer.colorIt(AshenFarmer.signs.nop)
+                -- Establish waiting time... 
+                AshenFarmer.drinkCheck = AshenFarmer.drinkWaitingTime
                 return
             end
-            i = i + 1
+            if (AshenFarmer.DEBUG) then print("That means, that we finished drinking!") end
+            AshenFarmer.drinkCheck = nil
+            AshenFarmer.drinking = false
+            AshenFarmer.doingNothing()
         end
         return
-    elseif (event == "UNIT_SPELLCAST_SUCCEEDED") then
+    end
+    
+    if (AshenFarmer.drinking) then return end
+
+    if (event == "UNIT_SPELLCAST_SUCCEEDED") then
+        if (player ~= "player") then return; end
         AshenFarmer.casting = false
     elseif (event == "PLAYER_TARGET_CHANGED") then 
         AshenFarmer.targetting = false
         AshenFarmer.casting = false
+    elseif (event == "UNIT_SPELLCAST_FAILED") then
+        if (player ~= "player" or not AshenFarmer.casting) then return; end
+        if (AshenFarmer.manaLow()) then
+            if (AshenFarmer.DEBUG) then print("We ran out of mana in the middle of combat!") end
+            AshenFarmer.drink()
+        elseif (not AshenFarmer.hasValidTarget()) then
+            AshenFarmer.targetNearestEnemy()
+        end
     end
 
     -- All the other events (Spellcast succeeded and Target died) are basically saying that we are doing nothing...
@@ -107,6 +143,24 @@ function AshenFarmer.f_OnEvent(self, event, ...)
 end
 
 AshenFarmer.f:SetScript("OnEvent", AshenFarmer.f_OnEvent)
+
+function AshenFarmer.isDrinking()
+    -- Go through the list of buffs and search for a drink buff. 
+    local i = 1
+    while (true) do
+        local name, _, _, _, _, _, _, _, _, _, _ = UnitBuff("player", i)
+        if (name == nil) then
+            return false
+        elseif (name == "Drink") then
+            return true
+        end
+        i = i + 1
+    end
+end
+
+function AshenFarmer.manaLow() 
+    return AshenFarmer.getManaPercentage() < 0.2
+end
 
 function AshenFarmer.getManaPercentage()
     return UnitPower("Player") / UnitManaMax("Player")
@@ -118,7 +172,7 @@ end
 
 -- Signs to the clicker, that we want to target next enemy
 function AshenFarmer.targetNearestEnemy() 
-    print("Targetting next enemy...")
+    if (AshenFarmer.DEBUG) then print("Targetting next enemy...") end
     AshenFarmer.targetting = true
     AshenFarmer.casting = false
     AshenFarmer.drinking = false
@@ -127,7 +181,7 @@ end
 
 -- Signs to the clicker, that we want to drink
 function AshenFarmer.drink()
-    print("Drinking...")
+    if (AshenFarmer.DEBUG) then print("Drinking...") end
     AshenFarmer.targetting = false
     AshenFarmer.casting = false
     AshenFarmer.drinking = true
@@ -137,7 +191,7 @@ end
 
 -- Signs to the clicker, that we want to cast a spell
 function AshenFarmer.cast()
-    print("Casting...")
+    if (AshenFarmer.DEBUG) then print("Casting...") end
     AshenFarmer.targetting = false
     AshenFarmer.casting = true
     AshenFarmer.drinking = false
@@ -145,24 +199,21 @@ function AshenFarmer.cast()
 end
 
 function AshenFarmer.doingNothing()
-    if (AshenFarmer.drinking or AshenFarmer.casting or AshenFarmer.targetting) then 
-        print("We got to doingNothing even though we are doing SOMETHING!")
-        return 
-    end
+    if (AshenFarmer.drinking or AshenFarmer.casting or AshenFarmer.targetting) then return; end
 
-    print("=== Doing nothing ===")
+    if (AshenFarmer.DEBUG) then print("=== Doing nothing ===") end
 
     if (AshenFarmer.hasValidTarget()) then
-        print("Our new target is valid, good to kill.")
+        if (AshenFarmer.DEBUG) then print("Our new target is valid, good to kill.") end
         AshenFarmer.cast()
     else
         if (AshenFarmer.drinking) then
-            print("Detected drinking started!")
+            if (AshenFarmer.DEBUG) then print("Detected drinking started!") end
         else
-            print("Our target is not valid")
+            if (AshenFarmer.DEBUG) then print("Our target is not valid") end
             -- Unit died or we targetted wrong enemy
-            if (AshenFarmer.getManaPercentage() < 0.2) then
-                print("We have less than twenty-percent of mana!")
+            if (AshenFarmer.manaLow()) then
+                if (AshenFarmer.DEBUG) then print("We have less than twenty-percent of mana!") end
                 AshenFarmer.drink()
             else
                 AshenFarmer.targetNearestEnemy()
